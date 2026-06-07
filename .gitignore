@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+.env/
+.env.*
+.venv/
+
+# Editor and OS files
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# adb / temporary screenshots
+/tmp/*.png
+*.log
+
+# Seed-finder artifacts
+*.jar
+.lwjgl/
+sd_char_lib.pkl
+
+# Misc
+*.bak
