@@ -31,14 +31,35 @@ Examples:
   python3 spd_runner.py '%tier4.*\\+3' 1
 """
 
-import argparse, subprocess, time, re
+import argparse, subprocess, time, re, signal, os
 from functools import lru_cache
 
 import numpy as np
 from PIL import Image
 
+from spd_tui import ui, SEED_CROP
+
 SEED_FINDER = "/home/tris/pequod/tris/tools/seed-finder-3/seed-finder-3.3.0/seed-finder.jar"
 FLOORS      = 7
+
+# Long-running seed-finder children, tracked so a Ctrl-C can kill them at once
+# instead of blocking until they finish. They run in their own session
+# (start_new_session) so the terminal's SIGINT reaches only us, not them.
+_ACTIVE_PROCS = set()
+
+
+def _install_sigint_handler():
+    """Make Ctrl-C terminate the current run promptly and cleanly: kill any
+    in-flight seed-finder subprocess, then raise KeyboardInterrupt so __main__
+    can tear down the dashboard and print the abort notice."""
+    def handler(signum, frame):
+        for p in list(_ACTIVE_PROCS):
+            try:
+                p.kill()
+            except Exception:
+                pass
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGINT, handler)
 
 # Row y-centers by total items on screen (saves + NGB button if saves < 6)
 ROW_CENTERS = {
@@ -140,7 +161,7 @@ def _read_seed_from_card(png_path):
     out = subprocess.run(
         ["tesseract", png_path, "stdout",
          "-c", "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ- "],
-        capture_output=True, text=True
+        capture_output=True, text=True, start_new_session=True
     ).stdout
     return _parse_seed_from_text(out)
 
@@ -171,7 +192,7 @@ def _row_has_new_game(img, row_y):
     out = subprocess.run([
         "tesseract", tmp_path, "stdout",
         "-c", "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz "],
-        capture_output=True, text=True
+        capture_output=True, text=True, start_new_session=True
     ).stdout.lower()
     return bool(re.search(r'new\s*game|newgame', out))
 
@@ -201,7 +222,8 @@ def _detect_save_count_from_layout(png_path):
 def capture_seed_card(row_y, png_path):
     """Tap the save row, screenshot the card, and dismiss the card."""
     tap(280, row_y)
-    subprocess.run(f"adb exec-out screencap -p > {png_path}", shell=True, check=True)
+    subprocess.run(f"adb exec-out screencap -p > {png_path}", shell=True, check=True,
+                   start_new_session=True)
     tap(360, 1350)                 # Dismiss
 
 
@@ -211,26 +233,70 @@ def read_seed(row_y, png_path):
     return png_path
 
 
+def _tesseract(args):
+    """Launch a tesseract reader (stdout) with the seed whitelist."""
+    return subprocess.Popen(
+        ["tesseract", *args, "stdout",
+         "-c", "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ- "],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True)
+
+
+def _combine_ocr(full_text, crop_text):
+    """Two independent reads of a card: tesseract on the whole screenshot
+    (primary) and on the cropped seed line (backup). Return (seed, source).
+    Malformed crops fail the strict XXX-XXX-XXX regex and self-reject, so the
+    backup only wins when the primary couldn't read a valid seed at all."""
+    full = _parse_seed_from_text(full_text)
+    crop = _parse_seed_from_text(crop_text)
+    if full and crop and full == crop:
+        return full, "full+crop agree"
+    if full:
+        return full, "full"
+    if crop:
+        return crop, "crop backup"
+    return None, "both failed"
+
+
 def read_seeds_from_screenshots(paths):
-    """OCR multiple seed screenshots in parallel."""
-    procs = {
-        path: subprocess.Popen(
-            ["tesseract", path, "stdout",
-             "-c", "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ- "],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-        )
-        for path in paths
-    }
+    """OCR each card two ways in parallel — full screenshot (primary) and
+    cropped seed-line strip (backup) — and keep whichever yields a valid seed."""
+    # Pre-crop the seed-line strips for the backup pass.
+    crop_files = {}
+    for path in paths:
+        cpath = path + ".seedcrop.png"
+        try:
+            Image.open(path).convert("RGB").crop(SEED_CROP).save(cpath)
+            crop_files[path] = cpath
+        except Exception:
+            crop_files[path] = None
+
+    full_procs = {path: _tesseract([path]) for path in paths}
+    crop_procs = {path: _tesseract(["--psm", "7", cf])
+                  for path, cf in crop_files.items() if cf}
+
+    full_out = {path: p.communicate()[0] for path, p in full_procs.items()}
+    crop_out = {path: p.communicate()[0] for path, p in crop_procs.items()}
+
     results = {}
-    for path, p in procs.items():
-        out, _ = p.communicate()
-        results[path] = _parse_seed_from_text(out)
+    for path in paths:
+        seed, source = _combine_ocr(full_out.get(path, ""), crop_out.get(path, ""))
+        results[path] = seed
+        if seed and source == "crop backup":
+            ui.log(f"{seed}: recovered via cropped-strip backup OCR", "ocr")
+        cf = crop_files.get(path)
+        if cf:
+            try:
+                os.remove(cf)
+            except OSError:
+                pass
     return results
 
 # ── ADB helpers ───────────────────────────────────────────────────────────────
 
 def tap(x, y, wait=0.1):
-    subprocess.run(f"adb shell input tap {x} {y}", shell=True, check=True)
+    subprocess.run(f"adb shell input tap {x} {y}", shell=True, check=True,
+                   start_new_session=True)
     time.sleep(wait)
 
 def taps(*points, wait=0.1):
@@ -238,26 +304,28 @@ def taps(*points, wait=0.1):
     No sleeps between them — the on-device `input` command is slow enough to
     cover UI transitions."""
     cmd = "; ".join(f"input tap {x} {y}" for x, y in points)
-    subprocess.run(f'adb shell "{cmd}"', shell=True, check=True)
+    subprocess.run(f'adb shell "{cmd}"', shell=True, check=True,
+                   start_new_session=True)
     time.sleep(wait)
 
 # ── Game actions ──────────────────────────────────────────────────────────────
 
 def detect_save_count():
     """Count saves by screenshotting the games list and using OCR or button-layout detection."""
-    subprocess.run("adb exec-out screencap -p > /tmp/detect.png", shell=True, check=True)
+    subprocess.run("adb exec-out screencap -p > /tmp/detect.png", shell=True, check=True,
+                   start_new_session=True)
     out = subprocess.run(["tesseract", "/tmp/detect.png", "stdout"],
-                         capture_output=True, text=True).stdout
+                         capture_output=True, text=True, start_new_session=True).stdout
     t = out.lower()
     # Each save shows a timestamp: "X minutes ago", "just now", "moments ago", etc.
     count = t.count(' ago') + t.count('just now') + t.count('moments ago')
     if count == 0:
-        print("  OCR save-count detection failed; checking New Game row")
+        ui.log("OCR save-count detection failed; checking New Game row", "warn")
         count = _detect_save_count_from_newgame("/tmp/detect.png")
         if count == 6:
-            print("  New Game check also missed; falling back to layout inference")
+            ui.log("New Game check also missed; falling back to layout inference", "warn")
             count = _detect_save_count_from_layout("/tmp/detect.png")
-    print(f"  Detected {count} save(s)")
+    ui.log(f"Detected {count} existing save(s) on device", "scan")
     return count
 
 def nav_to_games_list():
@@ -356,136 +424,216 @@ def check_seed(seed, criteria):
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
-def run(criteria, required_count, char="duelist", preserve_existing=False):
+def _device_serial():
+    """Best-effort ADB device id for the boot banner."""
+    try:
+        out = subprocess.run(["adb", "get-serialno"], capture_output=True,
+                             text=True, timeout=5).stdout.strip()
+        return out or "?"
+    except Exception:
+        return "?"
+
+
+def run(criteria, required_count, char="duelist", preserve_existing=None):
     matching = {}   # seed → match_text for preserved saves
     iteration = 0
     run_floors = max(fl for _, fl in criteria)
+
+    ui.boot(criteria, required_count, char, device=_device_serial())
 
     # Navigate to games list once — stay there throughout
     nav_to_games_list()
     save_count = detect_save_count()
 
-    # Saves present at startup are the oldest, so they sit on the bottom rows;
-    # with --preserve-existing we never tap, OCR, or delete them.
-    protected_count = save_count if preserve_existing else 0
+    # How many existing saves to protect: they're the oldest, so they sit on the
+    # bottom rows and we never tap, OCR, or delete them. --preserve-existing
+    # forces all; otherwise ask (All/None/1-N/Quit) when saves exist.
+    if preserve_existing is True:
+        protected_count = save_count
+    elif save_count > 0:
+        protected_count = ui.ask_preserve_count(save_count)
+        if protected_count is None:
+            ui.log("Aborted at preservation prompt — no changes made.", "warn")
+            return
+    else:
+        protected_count = 0
+
     target = required_count
-    if preserve_existing:
+    if protected_count:
         available = 6 - protected_count
         if available <= 0:
-            print("All 6 slots hold existing saves — nothing to do with --preserve-existing.")
+            ui.log("All 6 slots hold preserved saves — nothing to do.", "warn")
             return
         if target > available:
-            print(f"  Target {target} exceeds {available} free slot(s); filling free slots instead.")
+            ui.log(f"Target {target} exceeds {available} free slot(s); filling free slots instead.", "warn")
             target = available
 
     while len(matching) < target:
         iteration += 1
-        print(f"\n── Iteration {iteration} ──")
+        ui.iteration(iteration)
+        cycle_start = time.time()
 
-        # Fill to 6 saves
-        while save_count < 6:
-            print(f"  Creating game {save_count+1}/6 ({char})...")
-            create_game(char, save_count)   # returns to main menu
-            nav_to_games_list()
-            save_count += 1
-
-        # Read seeds — already on games list. Bottom-up row order is:
-        # protected startup saves (oldest), then preserved matches, then live saves.
+        # Row geometry for the 6-slot grid. Saves sink to the bottom over time,
+        # so bottom-up the order is: protected startup saves (oldest), then
+        # preserved matches, then the live rows we (re)spawn at the top.
         preserved_seeds = list(matching.keys())
-        seeds = []
         rows = ROW_CENTERS[6]
         first_protected_row = len(rows) - protected_count
         first_preserved_row = first_protected_row - len(preserved_seeds)
+
+        # Lay the held rows out at the bottom *before* spawning, so the grid
+        # matches the device: new saves appear at the top, not at the next
+        # index, and a preserved seed stays in its real (bottom) row.
+        for i in range(first_preserved_row, len(rows)):
+            if i >= first_protected_row:
+                ui.slot(i, status="protected", seed=None, detail="existing save — untouched")
+            else:
+                seed = preserved_seeds[i - first_preserved_row]
+                ui.slot(i, status="vaulted", seed=seed, detail="held in vault")
+                ui.show_vaulted(i, seed)   # re-show its match intel + screenshot
+
+        # Fill the top rows to 6 saves — each new save spawns into the top row.
+        spawn_row = 0
+        while save_count < 6:
+            ui.slot(spawn_row, status="spawning", detail=f"new {char}")
+            with ui.status(f"Spawning save {save_count+1}/6 · class {char}…"):
+                create_game(char, save_count)   # returns to main menu
+                nav_to_games_list()
+            ui.slot(spawn_row, status="spawned", detail=f"{char} ready")
+            ui.log(f"Save {save_count+1}/6 spawned · class {char}", "ok")
+            save_count += 1
+            spawn_row += 1
+
+        # Read seeds — already on games list; held rows already laid out above.
+        seeds = []
         for i, ry in enumerate(rows):
             if i >= first_protected_row:
-                print(f"  Row {i+1}: protected existing save — untouched")
+                ui.clear_strip(i)
+                ui.log(f"Row {i+1}: protected existing save — untouched", "info")
                 seeds.append({"row_y": ry, "seed": None, "kind": "protected", "screenshot": None})
             elif i >= first_preserved_row:
                 seed = preserved_seeds[i - first_preserved_row]
-                print(f"  Row {i+1} preserved seed: {seed}")
+                ui.log(f"Row {i+1}: vaulted seed {seed} held in slot", "ok")
                 seeds.append({"row_y": ry, "seed": seed, "kind": "matched", "screenshot": None})
             else:
                 path = f"/tmp/card-{i}.png"
-                read_seed(ry, path)
-                print(f"  Row {i+1} screenshot saved: {path}")
+                ui.slot(i, status="scanning")
+                with ui.status(f"Capturing seed intercept · row {i+1}/{len(rows)}…"):
+                    read_seed(ry, path)
+                ui.capture_strip(i, path)   # appears immediately, one at a time
                 seeds.append({"row_y": ry, "seed": None, "kind": "live", "screenshot": path})
 
-        print("  Running OCR on new saves...")
         screenshot_paths = [entry["screenshot"] for entry in seeds if entry["kind"] == "live"]
-        ocr_results = read_seeds_from_screenshots(screenshot_paths)
+        with ui.status("Decoding seeds · template-OCR core…"):
+            ocr_results = read_seeds_from_screenshots(screenshot_paths)
         for idx, entry in enumerate(seeds):
             if entry["kind"] != "live":
                 continue
             entry["seed"] = ocr_results.get(entry["screenshot"])
             if entry["seed"] is None:
-                print(f"    Row {idx+1} unknown: OCR failed")
+                ui.slot(idx, status="error", detail="OCR failed")
+                ui.set_seed(idx, "??? OCR FAIL", status="error")
+                ui.log(f"Row {idx+1}: OCR failed — seed unreadable", "err")
             else:
-                print(f"    Row {idx+1} seed: {entry['seed']}")
+                ui.slot(idx, status="decoded", seed=entry["seed"])
+                ui.set_seed(idx, entry["seed"])
+                ui.log(f"Row {idx+1}: decoded {entry['seed']}", "ocr")
 
         # Run seed finder on new/unverified saves only
-        print("  Running seed finder...")
+        seed_row = {}   # seed → slot index, for dashboard updates
         procs = {}
-        for entry in seeds:
+        for i, entry in enumerate(seeds):
             if entry["kind"] != "live":
                 continue
             seed = entry["seed"]
             if seed is None:
-                print(f"    Row unknown: OCR failed — skipping")
                 continue
+            seed_row[seed] = i
+            ui.slot(i, status="checking")
             procs[seed] = subprocess.Popen(
                 ["java", "-jar", SEED_FINDER, str(run_floors), seed],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                start_new_session=True
             )
+            _ACTIVE_PROCS.add(procs[seed])
 
         results = {}
-        for seed, p in procs.items():
-            try:
-                out, _ = p.communicate(timeout=SEED_FINDER_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                p.kill()
-                out, _ = p.communicate()
-                print(f"    {seed}: timed out after {SEED_FINDER_TIMEOUT}s")
-                results[seed] = ""
-                continue
-            lines = _match_criteria(out, criteria)
-            results[seed] = "\n".join(lines) if lines else ""
-            print(f"    {seed}: " + ("MATCH (all patterns)" if lines else "no match"))
-            for line in lines or []:
-                print(f"      {line}")
+        with ui.status(f"Cross-referencing {len(procs)} seed(s) against dungeon oracle…"):
+            for seed, p in procs.items():
+                idx = seed_row[seed]
+                try:
+                    out, _ = p.communicate(timeout=SEED_FINDER_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    out, _ = p.communicate()
+                    ui.slot(idx, status="reject", detail="oracle timeout")
+                    ui.log(f"{seed}: oracle timed out after {SEED_FINDER_TIMEOUT}s", "err")
+                    results[seed] = ""
+                    continue
+                finally:
+                    _ACTIVE_PROCS.discard(p)
+                lines = _match_criteria(out, criteria)
+                results[seed] = "\n".join(lines) if lines else ""
+                if lines:
+                    ui.slot(idx, status="vaulted", detail=lines[0])
+                    ui.mark_match(idx, seed, seeds[idx]["screenshot"], lines)
+                else:
+                    ui.slot(idx, status="reject")
+                    ui.mark_reject(idx)
+                ui.verdict(seed, lines or None)
 
         # Already on games list after last seed dismiss — no nav tap needed
 
         # Delete non-matching live saves top-down; matched and protected rows stay
         saves_remaining = 6
         entries = list(seeds)  # top to bottom order
+        orig_index = {id(e): k for k, e in enumerate(seeds)}
 
         # Walk top-down; always re-read position from table after each deletion
         i = 0
         while i < len(entries):
             entry = entries[i]
-            keep = entry["kind"] != "live" or bool(results.get(entry["seed"]))
+            seed = entry["seed"]
+            # An operator purge mark overrides preservation: delete even a
+            # vaulted/matched save the operator flagged via the 1-6 keys.
+            marked = ui.is_marked(seed)
+            keep = (not marked) and (entry["kind"] != "live" or bool(results.get(seed)))
             if not keep:
                 # total items on screen = saves + NGB (unless saves == 6, no NGB)
                 total_items = saves_remaining if saves_remaining == 6 else saves_remaining + 1
                 ry = ROW_CENTERS[total_items][i]
-                print(f"  Deleting row {i+1} ({entry['seed']})...")
+                ui.slot(orig_index[id(entry)], status="purged")
+                ui.log(f"Purging row {i+1} · {seed}" + (" (operator-marked)" if marked else ""),
+                       "kill")
                 delete_save(ry)
                 saves_remaining -= 1
                 entries.pop(i)
+                if seed is not None:
+                    matching.pop(seed, None)
+                    ui.clear_mark(seed)
+                    ui.unvault(seed)
                 # don't increment i — next entry shifts into position i
             else:
                 if entry["kind"] == "live":
-                    matching[entry["seed"]] = results[entry["seed"]]
+                    matching[seed] = results[seed]
                 i += 1
 
         save_count = saves_remaining
-        print(f"  Matching so far: {len(matching)}/{target}: {list(matching.keys())}")
+        # One pipeline pass (spawn→OCR→check→purge) over this cycle's live rows;
+        # feed its wall time and live-seed count into the running per-seed avg.
+        ui.cycle_timing(len(screenshot_paths), time.time() - cycle_start)
+        ui.progress(len(matching), target, list(matching.keys()))
 
-    print(f"\n✓ Done. {len(matching)} matching save(s):")
-    for seed, items in matching.items():
-        print(f"  {seed}:")
-        for line in items.splitlines():
-            print(f"    {line}")
+        # In-run controls: finish this cycle, then pause and/or end as requested.
+        if ui.pause_requested:
+            ui.enter_pause()
+            while ui.paused and not ui.end_requested:
+                time.sleep(0.15)
+        if ui.end_requested:
+            ui.log(f"Run ended by operator — {len(matching)} seed(s) preserved", "warn")
+            break
+
+    ui.complete(matching)
 
 def parse_args(argv):
     """Return (criteria, count, char, preserve_existing) from CLI args."""
@@ -518,7 +666,8 @@ def parse_args(argv):
                     help=f"max floor per pattern: one value for all patterns, "
                          f"or one per pattern (default {FLOORS})")
     ap.add_argument("--preserve-existing", action="store_true",
-                    help="never delete saves present at startup; work in the free slots")
+                    help="never delete saves present at startup; work in the free "
+                         "slots (if omitted, you're asked at runtime when saves exist)")
 
     # argparse can't disambiguate a trailing optional positional after nargs='+',
     # so peel off a class name (last positional, possibly before flags) ourselves
@@ -545,9 +694,17 @@ def parse_args(argv):
         except re.error as e:
             ap.error(f"bad regex {pat!r}: {e}")
 
-    return criteria, args.count, char, args.preserve_existing
+    # None → ask interactively at runtime if saves exist; True → force preserve
+    return criteria, args.count, char, (True if args.preserve_existing else None)
 
 
 if __name__ == "__main__":
     import sys
-    run(*parse_args(sys.argv[1:]))
+    _install_sigint_handler()
+    try:
+        run(*parse_args(sys.argv[1:]))
+    except KeyboardInterrupt:
+        ui.abort("Run aborted by operator (Ctrl-C)")
+        sys.exit(130)
+    finally:
+        ui.shutdown()
